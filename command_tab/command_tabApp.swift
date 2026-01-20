@@ -438,6 +438,329 @@ final class WindowEnumerator {
             app.activate(options: [])
         }
     }
+
+    /// Get a flat list of all windows for the switcher
+    func getAllWindowsFlat() -> [SwitcherWindowItem] {
+        var result: [SwitcherWindowItem] = []
+
+        let runningApps = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular
+        }
+
+        for app in runningApps {
+            let pid = app.processIdentifier
+            let appName = app.localizedName ?? "Unknown"
+            let icon = app.icon
+
+            if app.bundleIdentifier == Bundle.main.bundleIdentifier {
+                continue
+            }
+
+            let axApp = AXUIElementCreateApplication(pid)
+
+            var windowsRef: AnyObject?
+            guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+                  let axWindows = windowsRef as? [AXUIElement] else {
+                continue
+            }
+
+            for axWindow in axWindows {
+                var titleRef: AnyObject?
+                let title: String
+                if AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef) == .success,
+                   let windowTitle = titleRef as? String, !windowTitle.isEmpty {
+                    title = windowTitle
+                } else {
+                    continue
+                }
+
+                var subroleRef: AnyObject?
+                if AXUIElementCopyAttributeValue(axWindow, kAXSubroleAttribute as CFString, &subroleRef) == .success,
+                   let subrole = subroleRef as? String {
+                    if subrole != "AXStandardWindow" && subrole != "AXFloatingWindow" && subrole != "AXDialog" {
+                        continue
+                    }
+                }
+
+                result.append(SwitcherWindowItem(
+                    appName: appName,
+                    windowTitle: title,
+                    icon: icon,
+                    axElement: axWindow,
+                    pid: pid
+                ))
+            }
+        }
+
+        return result
+    }
+}
+
+// MARK: - Switcher Window Item
+
+struct SwitcherWindowItem: Identifiable {
+    let id = UUID()
+    let appName: String
+    let windowTitle: String
+    let icon: NSImage?
+    let axElement: AXUIElement
+    let pid: pid_t
+}
+
+// MARK: - Window Switcher Panel
+
+final class WindowSwitcherPanel: NSPanel {
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+
+        isFloatingPanel = true
+        level = .screenSaver
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        hidesOnDeactivate = false
+    }
+}
+
+// MARK: - Event Tap Handler
+
+/// Handles low-level keyboard event interception (runs outside MainActor)
+final class EventTapHandler {
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private weak var controller: WindowSwitcherController?
+
+    init(controller: WindowSwitcherController) {
+        self.controller = controller
+        setupEventTap()
+    }
+
+    private func setupEventTap() {
+        let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(eventMask),
+            callback: { proxy, type, event, refcon in
+                guard let refcon = refcon else { return Unmanaged.passRetained(event) }
+                let handler = Unmanaged<EventTapHandler>.fromOpaque(refcon).takeUnretainedValue()
+                return handler.handleEvent(proxy: proxy, type: type, event: event)
+            },
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            Log.error("Failed to create event tap - accessibility permissions may be missing")
+            return
+        }
+
+        eventTap = tap
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+
+        if let source = runLoopSource {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        }
+
+        CGEvent.tapEnable(tap: tap, enable: true)
+        Log.debug("Event tap created successfully")
+    }
+
+    private func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        // Handle tap disabled events
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = eventTap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+            return Unmanaged.passRetained(event)
+        }
+
+        let flags = event.flags
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+
+        // Tab key code is 48
+        let isTab = keyCode == 48
+        let isCommandDown = flags.contains(.maskCommand)
+        let isShiftDown = flags.contains(.maskShift)
+
+        // Command+Tab or Command+Shift+Tab
+        if type == .keyDown && isTab && isCommandDown {
+            DispatchQueue.main.async { [weak self] in
+                guard let controller = self?.controller else { return }
+                Task { @MainActor in
+                    if controller.isVisible {
+                        if isShiftDown {
+                            controller.selectPrevious()
+                        } else {
+                            controller.selectNext()
+                        }
+                    } else {
+                        controller.show()
+                    }
+                }
+            }
+            return nil // Consume the event
+        }
+
+        // Command key released - hide and focus
+        if type == .flagsChanged && !isCommandDown {
+            DispatchQueue.main.async { [weak self] in
+                guard let controller = self?.controller else { return }
+                Task { @MainActor in
+                    if controller.isVisible {
+                        controller.hideAndFocus()
+                    }
+                }
+            }
+        }
+
+        return Unmanaged.passRetained(event)
+    }
+
+    func cleanup() {
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+        }
+    }
+
+    deinit {
+        cleanup()
+    }
+}
+
+// MARK: - Window Switcher Controller
+
+@Observable
+@MainActor
+final class WindowSwitcherController {
+    static let shared = WindowSwitcherController()
+
+    var isVisible = false
+    var windows: [SwitcherWindowItem] = []
+    var selectedIndex = 0
+
+    private var panel: WindowSwitcherPanel?
+    private var eventTapHandler: EventTapHandler?
+
+    private init() {
+        // Create event tap handler after self is initialized
+        eventTapHandler = EventTapHandler(controller: self)
+    }
+
+    func show() {
+        windows = WindowEnumerator.shared.getAllWindowsFlat()
+        guard !windows.isEmpty else { return }
+
+        selectedIndex = min(1, windows.count - 1) // Start at second item (first is current window)
+        isVisible = true
+
+        if panel == nil {
+            panel = WindowSwitcherPanel()
+        }
+
+        let contentView = NSHostingView(rootView: WindowSwitcherView())
+        panel?.contentView = contentView
+
+        // Size and center the panel
+        let width: CGFloat = 420
+        let rowHeight: CGFloat = 36
+        let padding: CGFloat = 16
+        let height = min(CGFloat(windows.count) * rowHeight + padding * 2, 500)
+
+        if let screen = NSScreen.main {
+            let screenFrame = screen.frame
+            let x = screenFrame.midX - width / 2
+            let y = screenFrame.midY - height / 2
+            panel?.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+        }
+
+        panel?.orderFrontRegardless()
+    }
+
+    func hide() {
+        isVisible = false
+        panel?.orderOut(nil)
+    }
+
+    func hideAndFocus() {
+        if selectedIndex < windows.count {
+            let selected = windows[selectedIndex]
+            // Raise the window
+            AXUIElementPerformAction(selected.axElement, kAXRaiseAction as CFString)
+            // Activate the app
+            if let app = NSRunningApplication(processIdentifier: selected.pid) {
+                app.activate(options: [])
+            }
+        }
+        hide()
+    }
+
+    func selectNext() {
+        guard !windows.isEmpty else { return }
+        selectedIndex = (selectedIndex + 1) % windows.count
+    }
+
+    func selectPrevious() {
+        guard !windows.isEmpty else { return }
+        selectedIndex = (selectedIndex - 1 + windows.count) % windows.count
+    }
+}
+
+// MARK: - Window Switcher View
+
+struct WindowSwitcherView: View {
+    private var controller = WindowSwitcherController.shared
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(controller.windows.enumerated()), id: \.element.id) { index, item in
+                HStack(spacing: 12) {
+                    if let icon = item.icon {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .frame(width: 32, height: 32)
+                    } else {
+                        Image(systemName: "app")
+                            .resizable()
+                            .frame(width: 32, height: 32)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.appName)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.primary)
+
+                        Text(item.windowTitle)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(index == controller.selectedIndex ?
+                              Color.accentColor.opacity(0.3) : Color.clear)
+                )
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(.ultraThinMaterial)
+        )
+    }
 }
 
 // MARK: - Accessibility Helpers
@@ -633,6 +956,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     NSApp.activate(ignoringOtherApps: true)
                 }
             }
+        } else {
+            // Initialize the window switcher (this sets up the event tap)
+            _ = WindowSwitcherController.shared
         }
     }
 }
