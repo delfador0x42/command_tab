@@ -1,0 +1,15 @@
+{
+  "originHash" : "d8043ba4ded7f7696f50b185caab3d20a6544a024f1dfe1754be75d758178782",
+  "pins" : [
+    {
+      "identity" : "keyboardshortcuts",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/delfador0x42/KeyboardShortcuts.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "1aef85578fdd4f9eaeeb8d53b7b4fc31bf08fe27"
+      }
+    }
+  ],
+  "version" : 3
+}
