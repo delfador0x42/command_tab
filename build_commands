@@ -1,0 +1,4 @@
+#swift build                    # Debug build
+#swift build -c release         # Release build
+#./Scripts/bundle-app.sh        # Create .app bundle
+#open .build/release/CommandTab.app  # Run the app

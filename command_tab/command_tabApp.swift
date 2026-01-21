@@ -80,33 +80,72 @@ final class WindowEnumerator {
 // MARK: - Panel
 
 final class WindowSwitcherPanel: NSPanel {
+
+    /// Initializes the panel with appropriate settings for a floating window switcher.
     init() {
         super.init(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
         isFloatingPanel = true
+
+        // Set to screen saver level to appear above everything
         level = .screenSaver
+
+        // Allow the panel to appear on all spaces and alongside fullscreen apps
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        // Don't hide when the app deactivates
+        hidesOnDeactivate = false
+    }
+
+    /// Configures the panel's visual appearance.
+    private func configureAppearance() {
+        // Make the panel itself transparent (content will provide visuals)
         isOpaque = false
         backgroundColor = .clear
+
+        // Enable shadow for depth effect
         hasShadow = true
-        hidesOnDeactivate = false
     }
 }
 
 // MARK: - Event Tap
 
-final class EventTapHandler {
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    private weak var controller: WindowSwitcherController?
+/// Handles global keyboard events to intercept Command+Tab and other shortcuts.
+/// Uses a low-level event tap to capture key events before they reach other applications.
+final class KeyboardEventTapHandler {
 
+    // MARK: Properties
+
+    /// The Core Foundation event tap for intercepting keyboard events
+    private var eventTap: CFMachPort?
+
+    /// The run loop source associated with the event tap
+    private var runLoopSource: CFRunLoopSource?
+
+    /// Weak reference to the controller to avoid retain cycles
+    private weak var windowSwitcherController: WindowSwitcherController?
+
+    // MARK: Key Codes
+
+    /// Key code for the Tab key
+    private let tabKeyCode: Int64 = 48
+
+    /// Key code for the 'U' key (used for debug randomize function)
+    private let uKeyCode: Int64 = 32
+
+    // MARK: Initialization
+
+    /// Initializes the event tap handler with a reference to the window switcher controller.
+    ///
+    /// - Parameter controller: The controller that will handle switcher actions
     init(controller: WindowSwitcherController) {
-        self.controller = controller
-        setupEventTap()
+        self.windowSwitcherController = controller
+        setupKeyboardEventTap()
     }
 
     private func setupEventTap() {
         let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
 
+        // Create the event tap
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
@@ -120,21 +159,29 @@ final class EventTapHandler {
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else { return }
 
+        // Store the tap reference
         eventTap = tap
+
+        // Create a run loop source for the tap
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+
+        // Add the source to the current run loop
         if let source = runLoopSource {
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
         }
+
+        // Enable the event tap
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
     private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            reenableEventTapIfNeeded()
             return Unmanaged.passRetained(event)
         }
 
-        let flags = event.flags
+        // Extract event properties
+        let modifierFlags = event.flags
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
 
         // Cmd+Tab - window switcher
@@ -178,20 +225,56 @@ final class EventTapHandler {
 
 // MARK: - Controller
 
+/// Main controller that manages the window switcher's state and behavior.
+/// Coordinates between the view, panel, and event handling.
 @Observable
 @MainActor
 final class WindowSwitcherController {
+
+    // MARK: Singleton
+
+    /// Shared singleton instance of the controller
     static let shared = WindowSwitcherController()
 
-    var isVisible = false
-    var windows: [SwitcherWindowItem] = []
-    var selectedIndex = 0
+    // MARK: Observable Properties
 
-    private var panel: WindowSwitcherPanel?
-    private var eventTapHandler: EventTapHandler?
+    /// Whether the window switcher panel is currently visible
+    var isVisible: Bool = false
 
+    /// The list of windows available for switching
+    var availableWindows: [SwitcherWindowItem] = []
+
+    /// The index of the currently selected window in the list
+    var selectedWindowIndex: Int = 0
+
+    // MARK: Private Properties
+
+    /// The floating panel that displays the switcher UI
+    private var switcherPanel: WindowSwitcherPanel?
+
+    /// The keyboard event tap handler for capturing shortcuts
+    private var keyboardEventHandler: KeyboardEventTapHandler?
+
+    // MARK: UI Constants
+
+    /// Width of the switcher panel in points
+    private let panelWidth: CGFloat = 420
+
+    /// Height per window item in the list
+    private let windowItemHeight: CGFloat = 36
+
+    /// Vertical padding in the panel
+    private let panelVerticalPadding: CGFloat = 32
+
+    /// Maximum height of the switcher panel
+    private let maximumPanelHeight: CGFloat = 500
+
+    // MARK: Initialization
+
+    /// Private initializer to enforce singleton pattern.
     private init() {
-        eventTapHandler = EventTapHandler(controller: self)
+        // Initialize the keyboard event handler
+        keyboardEventHandler = KeyboardEventTapHandler(controller: self)
     }
 
     func show() {
@@ -304,54 +387,213 @@ final class WindowSwitcherController {
 
 // MARK: - View
 struct WindowSwitcherView: View {
+
+    /// Reference to the shared controller
     private var controller = WindowSwitcherController.shared
+
+    // MARK: Body
 
     var body: some View {
         VStack(spacing: 0) {
-            ForEach(Array(controller.windows.enumerated()), id: \.element.id) { index, item in
-                HStack(spacing: 12) {
-                    if let icon = item.icon {
-                        Image(nsImage: icon).resizable().frame(width: 32, height: 32)
-                    } else {
-                        Image(systemName: "app").resizable().frame(width: 32, height: 32)
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.appName).font(.system(size: 13, weight: .medium))
-                        Text(item.windowTitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(index == controller.selectedIndex ? Color.accentColor.opacity(0.3) : Color.clear))
-            }
+            windowListContent
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 12).fill(.ultraThinMaterial))
+        .background(panelBackground)
+    }
+
+    // MARK: Subviews
+
+    /// The scrollable list of window items
+    private var windowListContent: some View {
+        ForEach(Array(controller.availableWindows.enumerated()), id: \.element.id) { index, windowItem in
+            WindowItemRow(
+                windowItem: windowItem,
+                isSelected: index == controller.selectedWindowIndex
+            )
+        }
+    }
+
+    /// The blurred background of the panel
+    private var panelBackground: some View {
+        RoundedRectangle(cornerRadius: 12)
+            .fill(.ultraThinMaterial)
+    }
+}
+
+// MARK: - Window Item Row
+
+/// A single row in the window switcher list, displaying one window's information.
+struct WindowItemRow: View {
+
+    /// The window item to display
+    let windowItem: SwitcherWindowItem
+
+    /// Whether this row is currently selected
+    let isSelected: Bool
+
+    // MARK: Constants
+
+    /// Size of the application icon
+    private let iconSize: CGFloat = 32
+
+    /// Font size for the application name
+    private let applicationNameFontSize: CGFloat = 13
+
+    /// Font size for the window title
+    private let windowTitleFontSize: CGFloat = 11
+
+    /// Horizontal padding for the row
+    private let horizontalPadding: CGFloat = 12
+
+    /// Vertical padding for the row
+    private let verticalPadding: CGFloat = 6
+
+    /// Spacing between icon and text
+    private let iconTextSpacing: CGFloat = 12
+
+    /// Spacing between application name and window title
+    private let textVerticalSpacing: CGFloat = 2
+
+    /// Corner radius for the selection highlight
+    private let selectionCornerRadius: CGFloat = 6
+
+    /// Opacity of the selection highlight
+    private let selectionHighlightOpacity: Double = 0.3
+
+    // MARK: Body
+
+    var body: some View {
+        HStack(spacing: iconTextSpacing) {
+            applicationIconView
+            windowTextContent
+            Spacer()
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, verticalPadding)
+        .background(selectionHighlight)
+    }
+
+    // MARK: Subviews
+
+    /// The application icon image
+    @ViewBuilder
+    private var applicationIconView: some View {
+        if let icon = windowItem.applicationIcon {
+            Image(nsImage: icon)
+                .resizable()
+                .frame(width: iconSize, height: iconSize)
+        } else {
+            Image(systemName: "app")
+                .resizable()
+                .frame(width: iconSize, height: iconSize)
+        }
+    }
+
+    /// The text content showing application name and window title
+    private var windowTextContent: some View {
+        VStack(alignment: .leading, spacing: textVerticalSpacing) {
+            applicationNameText
+            windowTitleText
+        }
+    }
+
+    /// The application name label
+    private var applicationNameText: some View {
+        Text(windowItem.applicationName)
+            .font(.system(size: applicationNameFontSize, weight: .medium))
+    }
+
+    /// The window title label
+    private var windowTitleText: some View {
+        Text(windowItem.windowTitle)
+            .font(.system(size: windowTitleFontSize))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+    }
+
+    /// The selection highlight background
+    private var selectionHighlight: some View {
+        RoundedRectangle(cornerRadius: selectionCornerRadius)
+            .fill(isSelected ? Color.accentColor.opacity(selectionHighlightOpacity) : Color.clear)
     }
 }
 
 // MARK: - App
 @main
-struct command_tabApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+struct CommandTabApplication: App {
+
+    /// The application delegate adaptor for handling app lifecycle events
+    @NSApplicationDelegateAdaptor(ApplicationDelegate.self) var applicationDelegate
+
+    // MARK: Body
 
     var body: some Scene {
+        menuBarScene
+    }
+
+    // MARK: Scenes
+
+    /// The menu bar extra that provides a way to quit the application
+    private var menuBarScene: some Scene {
         MenuBarExtra {
-            Button("Quit") { NSApplication.shared.terminate(nil) }
-                .keyboardShortcut("q")
+            quitButton
         } label: {
             Image(systemName: "diamond.inset.filled")
         }
         .menuBarExtraStyle(.menu)
     }
+
+    // MARK: Menu Bar Content
+
+    /// The icon displayed in the menu bar
+    private var menuBarIcon: some View {
+        Image(systemName: "diamond.inset.filled")
+    }
+
+    /// The quit button in the menu bar dropdown
+    private var quitButton: some View {
+        Button("Quit") {
+            NSApplication.shared.terminate(nil)
+        }
+        .keyboardShortcut("q")
+    }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+// MARK: - Application Delegate
+
+/// Handles application lifecycle events and initial setup.
+final class ApplicationDelegate: NSObject, NSApplicationDelegate {
+
+    /// Called when the application has finished launching.
+    /// Requests accessibility permissions and initializes the window switcher controller.
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if !AXIsProcessTrusted() {
-            AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeRetainedValue(): true] as CFDictionary)
+        requestAccessibilityPermissionsIfNeeded()
+        initializeWindowSwitcherController()
+    }
+
+    /// Checks if accessibility permissions are granted and prompts the user if not.
+    private func requestAccessibilityPermissionsIfNeeded() {
+        let accessibilityEnabled = AXIsProcessTrusted()
+
+        if !accessibilityEnabled {
+            print("ApplicationDelegate: Accessibility permissions not granted. Prompting user...")
+
+            // Create options dictionary requesting the prompt to be shown
+            let promptKey = kAXTrustedCheckOptionPrompt.takeRetainedValue()
+            let options = [promptKey: true] as CFDictionary
+
+            // This will show the system prompt asking for accessibility permissions
+            AXIsProcessTrustedWithOptions(options)
+        } else {
+            print("ApplicationDelegate: Accessibility permissions already granted")
         }
+    }
+
+    /// Initializes the window switcher controller singleton.
+    private func initializeWindowSwitcherController() {
+        // Access the shared instance to trigger initialization
         _ = WindowSwitcherController.shared
+
+        print("ApplicationDelegate: Window switcher controller initialized")
     }
 }

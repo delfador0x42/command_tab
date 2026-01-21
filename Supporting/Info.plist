@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+
+<!--
+    Info.plist for CommandTab Application
+
+    This property list defines the application's metadata and behavior settings.
+    It is used by the bundle-app.sh script when creating the .app bundle.
+
+    Key Settings:
+    - LSUIElement: Makes this a menu bar app (no Dock icon)
+    - NSHighResolutionCapable: Enables Retina display support
+    - CFBundleIdentifier: Must match the original Xcode project for consistency
+-->
+
+<plist version="1.0">
+<dict>
+
+    <!-- ================================================================== -->
+    <!-- MARK: Bundle Identification -->
+    <!-- ================================================================== -->
+
+    <!-- Unique identifier for this application bundle -->
+    <key>CFBundleIdentifier</key>
+    <string>wudan.command-tab</string>
+
+    <!-- Internal name of the bundle -->
+    <key>CFBundleName</key>
+    <string>CommandTab</string>
+
+    <!-- User-visible name displayed in Finder and menus -->
+    <key>CFBundleDisplayName</key>
+    <string>Command Tab</string>
+
+    <!-- Name of the executable file inside the bundle -->
+    <key>CFBundleExecutable</key>
+    <string>CommandTab</string>
+
+    <!-- Type of bundle (APPL = Application) -->
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <!-- ================================================================== -->
+    <!-- MARK: Version Information -->
+    <!-- ================================================================== -->
+
+    <!-- Marketing version shown to users (e.g., "1.0") -->
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+
+    <!-- Build version for internal tracking -->
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <!-- ================================================================== -->
+    <!-- MARK: System Requirements -->
+    <!-- ================================================================== -->
+
+    <!-- Minimum macOS version required to run this application -->
+    <key>LSMinimumSystemVersion</key>
+    <string>15.0</string>
+
+    <!-- ================================================================== -->
+    <!-- MARK: Application Behavior -->
+    <!-- ================================================================== -->
+
+    <!--
+        LSUIElement = true makes this a "UI Element" application:
+        - No icon appears in the Dock
+        - App appears only in the menu bar
+        - Does not appear in the application switcher (Cmd+Tab)
+        This is appropriate for a window switcher utility.
+    -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- ================================================================== -->
+    <!-- MARK: Display Settings -->
+    <!-- ================================================================== -->
+
+    <!-- Enable high-resolution (Retina) display support -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- ================================================================== -->
+    <!-- MARK: Icon Configuration -->
+    <!-- ================================================================== -->
+
+    <!--
+        Name of the icon file in the Resources directory.
+        The .icns extension is implied.
+        Note: Currently using SF Symbols for the menu bar icon,
+        but this supports a custom app icon if provided.
+    -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <!-- ================================================================== -->
+    <!-- MARK: Copyright Information -->
+    <!-- ================================================================== -->
+
+    <!-- Human-readable copyright string -->
+    <key>NSHumanReadableCopyright</key>
+    <string></string>
+
+</dict>
+</plist>
