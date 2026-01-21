@@ -1,145 +1,7 @@
-// WindowFetcher.swift  ←  Deluxe Edition 2025
 import AppKit
+import SwiftUI
 
-struct AppWindow: Identifiable, Equatable {
-    let id = UUID()
-    let appName: String
-    let title: String          // actual tab/page title when possible
-    let appIcon: NSImage?
-    let bundleID: String       // for debugging / filtering
-    
-    static func ==(lhs: AppWindow, rhs: AppWindow) -> Bool {
-        lhs.bundleID == rhs.bundleID && lhs.title == rhs.title
-    }
-}
-
-class WindowFetcher {
-    static let shared = WindowFetcher()
-    
-    func visibleWindows() -> [AppWindow] {
-        guard AXIsProcessTrusted() else { return [] }
-        
-        var results: [AppWindow] = []
-        let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
-        
-        for app in apps {
-            let pid = app.processIdentifier
-            let appElement = AXUIElementCreateApplication(pid)
-            
-            // Get windows
-            var windowsValue: AnyObject?
-            guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
-                  let windows = windowsValue as? [AXUIElement] else { continue }
-            
-            let appName = app.localizedName ?? "Unknown"
-            let bundleID = app.bundleIdentifier ?? ""
-            let icon = app.icon
-            
-            for window in windows {
-                // Skip minimized / tiny windows
-                var size = CGSize.zero
-                if let sizeValue = getAXValue(window, attribute: kAXSizeAttribute),
-                   AXValueGetValue(sizeValue, .cgSize, &size),
-                   size.width < 100 || size.height < 50 { continue }
-                
-                var rawTitle = getStringAttribute(window, kAXTitleAttribute) ?? ""
-                
-                // ──────── BROWSER TAB MAGIC STARTS HERE ────────
-                if bundleID.contains("Chrome") || bundleID.contains("Edge") || bundleID.contains("Brave") || bundleID.contains("Arc") || bundleID.contains("Orion") {
-                    if let tabTitle = getChromeLikeTabTitle(from: window) {
-                        rawTitle = tabTitle
-                    }
-                } else if bundleID == "com.apple.Safari" || bundleID == "com.apple.SafariTechnologyPreview" {
-                    if let tabTitle = getSafariTabTitle(from: window) {
-                        rawTitle = tabTitle
-                    }
-                }
-                // ──────── END OF BROWSER MAGIC ────────
-                
-                if !rawTitle.isEmpty || !rawTitle.contains("Untitled") {
-                    results.append(AppWindow(appName: appName, title: rawTitle, appIcon: icon, bundleID: bundleID))
-                }
-            }
-        }
-        
-        return results.sorted { $0.appName < $1.appName }
-    }
-    
-    // MARK: - Helper functions
-    
-    private func getStringAttribute(_ element: AXUIElement, _ attr: String) -> String? {
-        var value: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, attr as CFString, &value) == .success,
-              let string = value as? String else { return nil }
-        return string.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    
-    private func getAXValue(_ element: AXUIElement, attribute: String) -> AXValue? {
-        var value: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
-        return (value as! AXValue)
-    }
-    
-    // Works for Chrome, Edge, Brave, Arc, Orion, SigmaOS, etc.
-    private func getChromeLikeTabTitle(from window: AXUIElement) -> String? {
-        var children: AnyObject?
-        guard AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &children) == .success,
-              let childArray = children as? [AXUIElement] else { return nil }
-        
-        // First child is usually the toolbar → second child is the tab bar
-        for child in childArray {
-            var title: String?
-            if let tabTitle = getStringAttribute(child, kAXTitleAttribute),
-               !tabTitle.isEmpty,
-               !tabTitle.contains("Tab") { // ignore "New Tab", etc.
-                title = tabTitle
-            }
-            // Deeper dive into tab strip if needed
-            var subchildren: AnyObject?
-            if AXUIElementCopyAttributeValue(child, kAXChildrenAttribute as CFString, &subchildren) == .success,
-               let tabs = subchildren as? [AXUIElement] {
-                for tab in tabs {
-                    if let tabTitle = getStringAttribute(tab, kAXTitleAttribute), !tabTitle.isEmpty {
-                        return tabTitle // return first real tab title we find
-                    }
-                }
-            }
-            if let title = title { return title }
-        }
-        return nil
-    }
-    
-    // Safari (works on Safari 17 & 18)
-    private func getSafariTabTitle(from window: AXUIElement) -> String? {
-        var children: AnyObject?
-        guard AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &children) == .success,
-              let childArray = children as? [AXUIElement] else { return nil }
-        
-        for child in childArray {
-            if let role = getStringAttribute(child, kAXRoleAttribute),
-               role == "AXWebArea" {
-                return getStringAttribute(child, kAXTitleAttribute)
-            }
-            // Fallback: look deeper
-            if let title = getStringAttribute(child, kAXTitleAttribute), !title.isEmpty {
-                return title
-            }
-        }
-        return nil
-    }
-
-    /// Debug print all windows
-    func printAllWindows() {
-        let windows = visibleWindows()
-        print("\n========== WindowFetcher Results (\(windows.count) windows) ==========")
-        for (index, window) in windows.enumerated() {
-            print("  [\(index)] \(window.appName) - \(window.title)")
-        }
-        print("==========================================================\n")
-    }
-}
-
-// MARK: - Switcher Window Item
+// MARK: - Window Item
 
 struct SwitcherWindowItem: Identifiable {
     let id = UUID()
@@ -149,126 +11,77 @@ struct SwitcherWindowItem: Identifiable {
     let pid: pid_t
 }
 
-// MARK: - Window Enumerator (uses CGWindowList for z-order + AX for titles)
+// MARK: - Window Enumerator
 
 final class WindowEnumerator {
     static let shared = WindowEnumerator()
 
-    // Cache AX windows per pid to avoid repeated queries
-    private var axWindowCache: [pid_t: [AXUIElement]] = [:]
+    func getAllWindows() -> [SwitcherWindowItem] {
 
-    func getAllWindowsFlat() -> [SwitcherWindowItem] {
-        axWindowCache.removeAll()
-
-        // Get windows in z-order using CGWindowList (front to back)
         guard let windowInfoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return []
         }
 
         let myBundleID = Bundle.main.bundleIdentifier
         var results: [SwitcherWindowItem] = []
-        var seenWindows: Set<String> = [] // pid+title to avoid duplicates
+        var seen: Set<String> = []
 
-        // Iterate in z-order (CGWindowList returns front-to-back)
         for info in windowInfoList {
+		print(info)
             guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
-                  let layer = info[kCGWindowLayer as String] as? Int,
-                  layer == 0,
-                  let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat],
-                  let x = boundsDict["X"], let y = boundsDict["Y"],
-                  let w = boundsDict["Width"], let h = boundsDict["Height"] else {
-                continue
-            }
-
-            let cgBounds = CGRect(x: x, y: y, width: w, height: h)
-
-            // Skip tiny windows
-            if cgBounds.width < 100 || cgBounds.height < 50 { continue }
-
-            guard let app = NSRunningApplication(processIdentifier: pid),
+                  let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                  let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  let w = bounds["Width"], let h = bounds["Height"],
+                  w >= 100, h >= 50,
+                  let app = NSRunningApplication(processIdentifier: pid),
                   app.bundleIdentifier != myBundleID,
-                  app.activationPolicy == .regular else {
-                continue
-            }
+                  app.activationPolicy == .regular else { continue }
 
-            let appName = app.localizedName ?? "Unknown"
-            let icon = app.icon
+            let cgSize = CGSize(width: w, height: h)
 
-            // Get or cache AX windows for this app
-            let axWindows = getAXWindows(for: pid)
-
-            // Find the AX window that matches this CGWindow by bounds
-            for axWindow in axWindows {
-                var posRef: AnyObject?
+            for axWindow in getAXWindows(for: pid) {
                 var sizeRef: AnyObject?
-                guard AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &posRef) == .success,
-                      AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef) == .success else {
-                    continue
-                }
+                guard AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef) == .success else { continue }
 
-                var pos = CGPoint.zero
                 var size = CGSize.zero
-                AXValueGetValue(posRef as! AXValue, .cgPoint, &pos)
                 AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
 
-                // Match by size (position can differ due to coordinate system)
-                if abs(cgBounds.width - size.width) < 5 && abs(cgBounds.height - size.height) < 5 {
-                    // Get title
+                if abs(cgSize.width - size.width) < 5 && abs(cgSize.height - size.height) < 5 {
                     var titleRef: AnyObject?
                     guard AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef) == .success,
-                          let title = titleRef as? String, !title.isEmpty else {
-                        continue
-                    }
+                          let title = titleRef as? String, !title.isEmpty else { continue }
 
-                    // Check subrole
-                    var subroleRef: AnyObject?
-                    if AXUIElementCopyAttributeValue(axWindow, kAXSubroleAttribute as CFString, &subroleRef) == .success,
-                       let subrole = subroleRef as? String,
-                       subrole != "AXStandardWindow" && subrole != "AXFloatingWindow" && subrole != "AXDialog" {
-                        continue
-                    }
-
-                    // Avoid duplicates
                     let key = "\(pid)-\(title)"
-                    if seenWindows.contains(key) { continue }
-                    seenWindows.insert(key)
+                    guard !seen.contains(key) else { continue }
+                    seen.insert(key)
 
-                    print("  ADDED [\(results.count)]: \(appName) - \(title)")
-                    results.append(SwitcherWindowItem(appName: appName, windowTitle: title, icon: icon, pid: pid))
-                    break // Found match for this CGWindow
+                    results.append(SwitcherWindowItem(
+                        appName: app.localizedName ?? "Unknown",
+                        windowTitle: title,
+                        icon: app.icon,
+                        pid: pid
+                    ))
+                    break
                 }
             }
         }
-
-        print("Final: \(results.count) windows")
         return results
     }
 
     private func getAXWindows(for pid: pid_t) -> [AXUIElement] {
-        if let cached = axWindowCache[pid] { return cached }
-
         let axApp = AXUIElementCreateApplication(pid)
-        var windowsRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let windows = windowsRef as? [AXUIElement] else {
-            return []
-        }
-
-        axWindowCache[pid] = windows
+        var ref: AnyObject?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
+              let windows = ref as? [AXUIElement] else { return [] }
         return windows
     }
 }
 
-// MARK: - Window Switcher Panel
+// MARK: - Panel
 
 final class WindowSwitcherPanel: NSPanel {
     init() {
-        super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
+        super.init(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
         isFloatingPanel = true
         level = .screenSaver
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -279,7 +92,7 @@ final class WindowSwitcherPanel: NSPanel {
     }
 }
 
-// MARK: - Event Tap Handler
+// MARK: - Event Tap
 
 final class EventTapHandler {
     private var eventTap: CFMachPort?
@@ -292,23 +105,20 @@ final class EventTapHandler {
     }
 
     private func setupEventTap() {
-        let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
+        let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
 
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
-            eventsOfInterest: CGEventMask(eventMask),
-            callback: { proxy, type, event, refcon in
+            eventsOfInterest: CGEventMask(mask),
+            callback: { _, type, event, refcon in
                 guard let refcon = refcon else { return Unmanaged.passRetained(event) }
                 let handler = Unmanaged<EventTapHandler>.fromOpaque(refcon).takeUnretainedValue()
-                return handler.handleEvent(proxy: proxy, type: type, event: event)
+                return handler.handleEvent(type: type, event: event)
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else {
-            print("Failed to create event tap")
-            return
-        }
+        ) else { return }
 
         eventTap = tap
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
@@ -316,10 +126,9 @@ final class EventTapHandler {
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
         }
         CGEvent.tapEnable(tap: tap, enable: true)
-        print("Event tap created successfully")
     }
 
-    private func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passRetained(event)
@@ -327,44 +136,47 @@ final class EventTapHandler {
 
         let flags = event.flags
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        let isTab = keyCode == 48
-        let isCommandDown = flags.contains(.maskCommand)
-        let isShiftDown = flags.contains(.maskShift)
 
-        if type == .keyDown && isTab && isCommandDown {
+        // Cmd+Tab - window switcher
+        if type == .keyDown && keyCode == 48 && flags.contains(.maskCommand) {
             DispatchQueue.main.async { [weak self] in
-                guard let controller = self?.controller else { return }
+                guard let c = self?.controller else { return }
                 Task { @MainActor in
-                    if controller.isVisible {
-                        if isShiftDown { controller.selectPrevious() }
-                        else { controller.selectNext() }
+                    if c.isVisible {
+                        flags.contains(.maskShift) ? c.selectPrevious() : c.selectNext()
                     } else {
-                        controller.show()
+                        c.show()
                     }
                 }
             }
             return nil
         }
 
-        if type == .flagsChanged && !isCommandDown {
+        // Cmd+Ctrl+U - randomize window z-order
+        if type == .keyDown && keyCode == 32 && flags.contains(.maskCommand) && flags.contains(.maskControl) {
             DispatchQueue.main.async { [weak self] in
-                guard let controller = self?.controller else { return }
+                guard let c = self?.controller else { return }
                 Task { @MainActor in
-                    if controller.isVisible { controller.hideAndFocus() }
+                    c.randomizeWindowOrder()
+                }
+            }
+            return nil
+        }
+
+        if type == .flagsChanged && !flags.contains(.maskCommand) {
+            DispatchQueue.main.async { [weak self] in
+                guard let c = self?.controller else { return }
+                Task { @MainActor in
+                    if c.isVisible { c.hideAndFocus() }
                 }
             }
         }
 
         return Unmanaged.passRetained(event)
     }
-
-    func cleanup() {
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
-        if let source = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes) }
-    }
 }
 
-// MARK: - Window Switcher Controller
+// MARK: - Controller
 
 @Observable
 @MainActor
@@ -383,27 +195,25 @@ final class WindowSwitcherController {
     }
 
     func show() {
-        windows = WindowEnumerator.shared.getAllWindowsFlat()
+        windows = WindowEnumerator.shared.getAllWindows()
         guard !windows.isEmpty else { return }
 
         selectedIndex = min(1, windows.count - 1)
         isVisible = true
 
         if panel == nil { panel = WindowSwitcherPanel() }
-
-        let contentView = NSHostingView(rootView: WindowSwitcherView())
-        panel?.contentView = contentView
+        panel?.contentView = NSHostingView(rootView: WindowSwitcherView())
 
         let width: CGFloat = 420
-        let rowHeight: CGFloat = 36
-        let padding: CGFloat = 16
-        let height = min(CGFloat(windows.count) * rowHeight + padding * 2, 500)
+        let height = min(CGFloat(windows.count) * 36 + 32, 500)
 
         if let screen = NSScreen.main {
-            let frame = screen.frame
-            panel?.setFrame(NSRect(x: frame.midX - width/2, y: frame.midY - height/2, width: width, height: height), display: true)
+            let f = screen.frame
+            panel?.setFrame(NSRect(x: f.midX - width/2, y: f.midY - height/2, width: width, height: height), display: true)
         }
-        panel?.orderFrontRegardless()
+
+        NSApp.activate()
+        panel?.makeKeyAndOrderFront(nil)
     }
 
     func hide() {
@@ -414,47 +224,32 @@ final class WindowSwitcherController {
     func hideAndFocus() {
         guard selectedIndex < windows.count else { hide(); return }
         let selected = windows[selectedIndex]
-        isVisible = false
-        panel?.orderOut(nil)
+        hide()
         windows = []
         focusWindow(selected)
     }
 
     private func focusWindow(_ item: SwitcherWindowItem) {
         guard let targetApp = NSRunningApplication(processIdentifier: item.pid) else { return }
+
+        NSApp.yieldActivation(to: targetApp)
+        targetApp.activate()
+
         let axApp = AXUIElementCreateApplication(item.pid)
+        var ref: AnyObject?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
+              let axWindows = ref as? [AXUIElement] else { return }
 
-        // Find window by title
-        var windowsRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let axWindows = windowsRef as? [AXUIElement] else {
-            NSApp.yieldActivation(to: targetApp)
-            targetApp.activate()
-            return
-        }
-
-        var targetWindow: AXUIElement?
         for w in axWindows {
             var titleRef: AnyObject?
             if AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &titleRef) == .success,
                let title = titleRef as? String, title == item.windowTitle {
-                targetWindow = w
+                AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+                AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
+                AXUIElementSetAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, w)
                 break
             }
         }
-
-        guard let window = targetWindow else {
-            NSApp.yieldActivation(to: targetApp)
-            targetApp.activate()
-            return
-        }
-
-        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementSetAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, window)
-        AXUIElementSetAttributeValue(axApp, kAXMainWindowAttribute as CFString, window)
-        NSApp.yieldActivation(to: targetApp)
-        targetApp.activate()
     }
 
     func selectNext() {
@@ -466,12 +261,48 @@ final class WindowSwitcherController {
         guard !windows.isEmpty else { return }
         selectedIndex = (selectedIndex - 1 + windows.count) % windows.count
     }
+
+    func randomizeWindowOrder() {
+        // Get all windows
+        let allWindows = WindowEnumerator.shared.getAllWindows()
+        guard allWindows.count > 1 else { return }
+
+        // Shuffle them
+        let shuffled = allWindows.shuffled()
+
+        print("Randomizing window order:")
+        for (i, item) in shuffled.enumerated() {
+            print("  [\(i)] \(item.appName) - \(item.windowTitle)")
+        }
+
+        // Raise each window in shuffled order (last one raised ends up on top)
+        for item in shuffled {
+            guard let app = NSRunningApplication(processIdentifier: item.pid) else { continue }
+
+            let axApp = AXUIElementCreateApplication(item.pid)
+            var ref: AnyObject?
+            guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
+                  let axWindows = ref as? [AXUIElement] else { continue }
+
+            for w in axWindows {
+                var titleRef: AnyObject?
+                if AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &titleRef) == .success,
+                   let title = titleRef as? String, title == item.windowTitle {
+                    AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+                    app.activate()
+                    break
+                }
+            }
+
+            // Small delay between raises to let the system process
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        print("Done randomizing")
+    }
 }
 
-// MARK: - Window Switcher View
-
-import SwiftUI
-
+// MARK: - View
 struct WindowSwitcherView: View {
     private var controller = WindowSwitcherController.shared
 
@@ -501,7 +332,6 @@ struct WindowSwitcherView: View {
 }
 
 // MARK: - App
-
 @main
 struct command_tabApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -511,7 +341,7 @@ struct command_tabApp: App {
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .keyboardShortcut("q")
         } label: {
-            Image(systemName: "rectangle.on.rectangle")
+            Image(systemName: "diamond.inset.filled")
         }
         .menuBarExtraStyle(.menu)
     }
