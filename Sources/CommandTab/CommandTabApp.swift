@@ -28,6 +28,28 @@ func AXUIElementGetWindow(_ element: AXUIElement, _ windowID: inout CGWindowID) 
 @_silgen_name("SetFrontProcessWithOptions")
 func SetFrontProcessWithOptions(_ psn: inout ProcessSerialNumber, _ options: UInt32) -> OSStatus
 
+/// CGS private API to get the main connection ID to the window server
+/// Used by Contexts.app for direct window server communication
+@_silgen_name("CGSMainConnectionID")
+func CGSMainConnectionID() -> UInt32
+
+/// CGS private API to get the current active space ID
+@_silgen_name("CGSGetActiveSpace")
+func CGSGetActiveSpace(_ cid: UInt32) -> UInt64
+
+/// CGS private API to set the front process for a specific space
+/// This is the key API Contexts.app uses to bring windows to front
+@_silgen_name("CGSSpaceSetFrontPSN")
+func CGSSpaceSetFrontPSN(_ cid: UInt32, _ spaceID: UInt64, _ psn: inout ProcessSerialNumber) -> CGError
+
+/// Private SkyLight API to post raw event records to the WindowServer
+/// This is how AltTab makes a specific window the "key" window
+/// Parameters:
+///   - psn: ProcessSerialNumber of the target app
+///   - bytes: Raw pointer to event data to send to WindowServer (uint8_t*)
+@_silgen_name("SLPSPostEventRecordTo")
+func SLPSPostEventRecordTo(_ psn: inout ProcessSerialNumber, _ bytes: UnsafeMutablePointer<UInt8>) -> CGError
+
 /// Flag that indicates the activation was user-generated (simulates user click)
 private let kCPSUserGenerated: UInt32 = 0x1
 
@@ -895,12 +917,19 @@ final class WindowSwitcherController {
         var psn = ProcessSerialNumber()
         let psnResult = GetProcessForPID(windowItem.processIdentifier, &psn)
         if psnResult == noErr {
-            // Step 1: Use Carbon SetFrontProcessWithOptions (what Contexts.app uses)
+            // Step 1: Use CGS private API to set front process for the current space
+            // This is what Contexts.app uses - it directly tells the window server
+            let cid = CGSMainConnectionID()
+            let currentSpace = CGSGetActiveSpace(cid)
+            let cgsResult = CGSSpaceSetFrontPSN(cid, currentSpace, &psn)
+            print("WindowSwitcherController: CGSSpaceSetFrontPSN returned \(cgsResult) (space: \(currentSpace))")
+
+            // Step 2: Use Carbon SetFrontProcessWithOptions (also used by Contexts.app)
             // kSetFrontProcessCausedByUser tells the system this was user-initiated
             let carbonResult = SetFrontProcessWithOptions(&psn, kSetFrontProcessCausedByUser)
             print("WindowSwitcherController: SetFrontProcessWithOptions returned \(carbonResult)")
 
-            // Step 2: Also use SkyLight API for forceful activation
+            // Step 3: Also use SkyLight API for forceful activation
             // wid=0 means just activate the app, mode=kCPSUserGenerated simulates user click
             let slpsResult = SLPSSetFrontProcessWithOptions(&psn, 0, kCPSUserGenerated)
             print("WindowSwitcherController: SLPSSetFrontProcessWithOptions returned \(slpsResult)")
@@ -908,14 +937,14 @@ final class WindowSwitcherController {
             print("WindowSwitcherController: GetProcessForPID failed with \(psnResult)")
         }
 
-        // Step 2: Also call public API as backup
+        // Step 4: Also call public API as backup
         targetApplication.activate()
 
-        // Step 3: Small delay for WindowServer to process the activation
+        // Step 5: Small delay for WindowServer to process the activation
         // This gives the window server time to reorder windows before we try to raise ours
         usleep(50000) // 50ms
 
-        // Step 4: Raise the specific window via Accessibility API
+        // Step 6: Raise the specific window via Accessibility API
         raiseSpecificWindow(windowItem)
 
         // Clear the stored previous app reference
@@ -970,6 +999,10 @@ final class WindowSwitcherController {
                     if GetProcessForPID(windowItem.processIdentifier, &psn) == noErr {
                         let result = SLPSSetFrontProcessWithOptions(&psn, cgWindowID, kCPSUserGenerated)
                         print("WindowSwitcherController: SLPSSetFrontProcessWithOptions with windowID returned \(result)")
+
+                        // Use AltTab's technique: send raw event bytes to WindowServer to make window key
+                        // This sends the magic bytes that tell WindowServer to make this specific window the key window
+                        makeKeyWindow(&psn, windowID: cgWindowID)
                     }
                 }
 
@@ -1083,6 +1116,57 @@ final class WindowSwitcherController {
             mouseButton: .left
         ) {
             mouseUp.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// Makes a specific window the "key" window using raw WindowServer events.
+    ///
+    /// This is the technique used by AltTab to reliably focus windows. It sends raw event
+    /// bytes directly to the WindowServer via SLPSPostEventRecordTo. The byte pattern tells
+    /// WindowServer to make the specified window the key window (the window that receives
+    /// keyboard input).
+    ///
+    /// - Parameters:
+    ///   - psn: ProcessSerialNumber of the target application (passed inout)
+    ///   - windowID: The CGWindowID of the window to make key
+    private func makeKeyWindow(_ psn: inout ProcessSerialNumber, windowID: CGWindowID) {
+        // Create a 248-byte (0xf8) buffer filled with zeros
+        // This is the format expected by the WindowServer for event records
+        var bytes = [UInt8](repeating: 0, count: 0xf8)
+
+        // Set the length field at offset 0x04
+        bytes[0x04] = 0xf8
+
+        // Set flag at offset 0x3a (indicates we're targeting a specific window)
+        bytes[0x3a] = 0x10
+
+        // Copy the window ID into the buffer at offset 0x3c (4 bytes, little-endian)
+        var wid = windowID
+        withUnsafeBytes(of: &wid) { widBytes in
+            for i in 0..<min(widBytes.count, 4) {
+                bytes[0x3c + i] = widBytes[i]
+            }
+        }
+
+        // Fill bytes 0x20-0x2f with 0xff (16 bytes)
+        // This appears to be some kind of mask or identifier
+        for i in 0x20..<0x30 {
+            bytes[i] = 0xff
+        }
+
+        // Use withUnsafeMutableBufferPointer to get a raw pointer for the C function
+        bytes.withUnsafeMutableBufferPointer { buffer in
+            guard let baseAddress = buffer.baseAddress else { return }
+
+            // First event: set event type to 0x01 (window focus begin?)
+            baseAddress[0x08] = 0x01
+            let result1 = SLPSPostEventRecordTo(&psn, baseAddress)
+            print("WindowSwitcherController: SLPSPostEventRecordTo (0x01) returned \(result1)")
+
+            // Second event: set event type to 0x02 (window focus complete?)
+            baseAddress[0x08] = 0x02
+            let result2 = SLPSPostEventRecordTo(&psn, baseAddress)
+            print("WindowSwitcherController: SLPSPostEventRecordTo (0x02) returned \(result2)")
         }
     }
 
