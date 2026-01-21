@@ -101,6 +101,13 @@ let package = Package(
 
                 /// Define DEBUG symbol in debug builds for conditional compilation
                 .define("DEBUG", .when(configuration: .debug))
+            ],
+
+            /// Linker settings for private frameworks
+            linkerSettings: [
+                /// Link against SkyLight private framework for window management APIs
+                .unsafeFlags(["-F", "/System/Library/PrivateFrameworks"]),
+                .linkedFramework("SkyLight")
             ]
         )
     ],

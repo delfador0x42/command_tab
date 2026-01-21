@@ -1,6 +1,40 @@
 import AppKit
 import SwiftUI
 
+// MARK: - Private APIs for Window Management
+
+/// Private SkyLight API for forceful process activation.
+/// More reliable than NSRunningApplication.activate() for bringing apps to front.
+/// Parameters:
+///   - psn: ProcessSerialNumber of the target app
+///   - wid: Window ID (0 to just activate the app)
+///   - mode: Activation mode (0x1 = kCPSUserGenerated to simulate user click)
+@_silgen_name("_SLPSSetFrontProcessWithOptions")
+func SLPSSetFrontProcessWithOptions(_ psn: inout ProcessSerialNumber, _ wid: UInt32, _ mode: UInt32) -> CGError
+
+/// Private API to get ProcessSerialNumber from PID (the public one is deprecated/unavailable in Swift)
+@_silgen_name("GetProcessForPID")
+func GetProcessForPID(_ pid: pid_t, _ psn: inout ProcessSerialNumber) -> OSStatus
+
+/// Private API to get CGWindowID from an AXUIElement (bridges Accessibility to Core Graphics)
+/// This allows us to get the actual window server ID for a window element.
+/// From: https://github.com/crazzle/SwitchR (credits to Silica project)
+@_silgen_name("_AXUIElementGetWindow")
+func AXUIElementGetWindow(_ element: AXUIElement, _ windowID: inout CGWindowID) -> AXError
+
+/// Carbon API for setting front process with options (used by Contexts.app)
+/// This is more reliable than NSRunningApplication.activate() on modern macOS
+/// Options: kSetFrontProcessFrontWindowOnly = 1, kSetFrontProcessCausedByUser = 2 (what we want)
+@_silgen_name("SetFrontProcessWithOptions")
+func SetFrontProcessWithOptions(_ psn: inout ProcessSerialNumber, _ options: UInt32) -> OSStatus
+
+/// Flag that indicates the activation was user-generated (simulates user click)
+private let kCPSUserGenerated: UInt32 = 0x1
+
+/// Carbon SetFrontProcessWithOptions flags
+private let kSetFrontProcessFrontWindowOnly: UInt32 = 1 << 0
+private let kSetFrontProcessCausedByUser: UInt32 = 1 << 1
+
 // MARK: - Data Models
 
 /// Represents a single window that can be displayed in the window switcher.
@@ -664,6 +698,10 @@ final class WindowSwitcherController {
     /// The keyboard event tap handler for capturing shortcuts
     private var keyboardEventHandler: KeyboardEventTapHandler?
 
+    /// The application that was active before the switcher appeared.
+    /// Stored so we can tell it to yield activation to the target window's app.
+    private var previouslyActiveApplication: NSRunningApplication?
+
     // MARK: UI Constants
 
     /// Width of the switcher panel in points
@@ -690,6 +728,10 @@ final class WindowSwitcherController {
 
     /// Shows the window switcher panel with the current list of windows.
     func showWindowSwitcher() {
+        // Capture the currently active application before we activate ourselves
+        // This is needed so we can tell it to yield activation when the user picks a target window
+        previouslyActiveApplication = NSWorkspace.shared.frontmostApplication
+
         // Refresh the list of available windows
         availableWindows = WindowEnumerationService.shared.getAllVisibleWindows()
 
@@ -717,9 +759,10 @@ final class WindowSwitcherController {
         // Calculate and set the panel's frame
         configurePanelFrame()
 
-        // Activate our app and show the panel
-        NSApp.activate()
-        switcherPanel?.makeKeyAndOrderFront(nil)
+        // Show the panel WITHOUT activating our app
+        // The panel is a floating panel at screenSaver level, so it appears above everything
+        // By not activating our app, we avoid disrupting the window ordering of other apps
+        switcherPanel?.orderFrontRegardless()
 
         print("WindowSwitcherController: Showing window switcher with \(availableWindows.count) windows")
     }
@@ -835,6 +878,12 @@ final class WindowSwitcherController {
 
     /// Focuses a specific window, bringing it to the front and activating its application.
     ///
+    /// Uses a combination of private and public APIs for maximum reliability (same approach as Contexts.app):
+    /// 1. Carbon SetFrontProcessWithOptions - the API Contexts.app uses
+    /// 2. Private _SLPSSetFrontProcessWithOptions - SkyLight API
+    /// 3. Public NSRunningApplication.activate() - backup
+    /// 4. Accessibility API - raises specific window within the app
+    ///
     /// - Parameter windowItem: The window to focus
     private func focusWindow(_ windowItem: SwitcherWindowItem) {
         // Get the running application
@@ -843,12 +892,34 @@ final class WindowSwitcherController {
             return
         }
 
-        // Yield activation to the target app and activate it
-        NSApp.yieldActivation(to: targetApplication)
+        var psn = ProcessSerialNumber()
+        let psnResult = GetProcessForPID(windowItem.processIdentifier, &psn)
+        if psnResult == noErr {
+            // Step 1: Use Carbon SetFrontProcessWithOptions (what Contexts.app uses)
+            // kSetFrontProcessCausedByUser tells the system this was user-initiated
+            let carbonResult = SetFrontProcessWithOptions(&psn, kSetFrontProcessCausedByUser)
+            print("WindowSwitcherController: SetFrontProcessWithOptions returned \(carbonResult)")
+
+            // Step 2: Also use SkyLight API for forceful activation
+            // wid=0 means just activate the app, mode=kCPSUserGenerated simulates user click
+            let slpsResult = SLPSSetFrontProcessWithOptions(&psn, 0, kCPSUserGenerated)
+            print("WindowSwitcherController: SLPSSetFrontProcessWithOptions returned \(slpsResult)")
+        } else {
+            print("WindowSwitcherController: GetProcessForPID failed with \(psnResult)")
+        }
+
+        // Step 2: Also call public API as backup
         targetApplication.activate()
 
-        // Use Accessibility API to raise the specific window
+        // Step 3: Small delay for WindowServer to process the activation
+        // This gives the window server time to reorder windows before we try to raise ours
+        usleep(50000) // 50ms
+
+        // Step 4: Raise the specific window via Accessibility API
         raiseSpecificWindow(windowItem)
+
+        // Clear the stored previous app reference
+        previouslyActiveApplication = nil
 
         print("WindowSwitcherController: Focused window '\(windowItem.windowTitle)' in '\(windowItem.applicationName)'")
     }
@@ -886,7 +957,30 @@ final class WindowSwitcherController {
                let windowTitle = titleAttributeValue as? String,
                windowTitle == windowItem.windowTitle {
 
-                // Raise the window
+                // Get the CGWindowID from the AXUIElement using private API
+                // This bridges Accessibility to Core Graphics for more direct window control
+                var cgWindowID: CGWindowID = 0
+                let windowIDResult = AXUIElementGetWindow(accessibilityWindow, &cgWindowID)
+                if windowIDResult == .success && cgWindowID != 0 {
+                    print("WindowSwitcherController: Got CGWindowID \(cgWindowID) for window '\(windowTitle)'")
+
+                    // Try using the window ID with SLPSSetFrontProcessWithOptions
+                    // This tells the window server to focus this specific window
+                    var psn = ProcessSerialNumber()
+                    if GetProcessForPID(windowItem.processIdentifier, &psn) == noErr {
+                        let result = SLPSSetFrontProcessWithOptions(&psn, cgWindowID, kCPSUserGenerated)
+                        print("WindowSwitcherController: SLPSSetFrontProcessWithOptions with windowID returned \(result)")
+                    }
+                }
+
+                // Set the application as frontmost via Accessibility API
+                AXUIElementSetAttributeValue(
+                    accessibilityApplication,
+                    kAXFrontmostAttribute as CFString,
+                    kCFBooleanTrue
+                )
+
+                // Raise the window to bring it to front within the app
                 AXUIElementPerformAction(accessibilityWindow, kAXRaiseAction as CFString)
 
                 // Set as main window
@@ -896,15 +990,99 @@ final class WindowSwitcherController {
                     kCFBooleanTrue
                 )
 
-                // Set as focused window
+                // Set focused attribute directly on the window (per SwitchR approach)
+                AXUIElementSetAttributeValue(
+                    accessibilityWindow,
+                    kAXFocusedAttribute as CFString,
+                    kCFBooleanTrue
+                )
+
+                // Also set as focused window on the app
                 AXUIElementSetAttributeValue(
                     accessibilityApplication,
                     kAXFocusedWindowAttribute as CFString,
                     accessibilityWindow
                 )
 
+                // Post a synthetic mouse click on the window's title bar
+                // This is the most "user-like" action and forces the window server to respect it
+                postSyntheticClickOnWindow(accessibilityWindow)
+
                 break
             }
+        }
+    }
+
+    /// Posts a synthetic mouse click on a window's title bar to force it to the front.
+    ///
+    /// This simulates what happens when a user physically clicks on a window - the window
+    /// server treats synthetic CGEvents as real user input and will bring the window forward.
+    ///
+    /// - Parameter windowElement: The AXUIElement representing the window
+    private func postSyntheticClickOnWindow(_ windowElement: AXUIElement) {
+        // Get the window's position
+        var positionValue: AnyObject?
+        let positionResult = AXUIElementCopyAttributeValue(
+            windowElement,
+            kAXPositionAttribute as CFString,
+            &positionValue
+        )
+
+        // Get the window's size
+        var sizeValue: AnyObject?
+        let sizeResult = AXUIElementCopyAttributeValue(
+            windowElement,
+            kAXSizeAttribute as CFString,
+            &sizeValue
+        )
+
+        guard positionResult == .success,
+              sizeResult == .success,
+              let positionAXValue = positionValue,
+              let sizeAXValue = sizeValue else {
+            print("WindowSwitcherController: Could not get window position/size for synthetic click")
+            return
+        }
+
+        // Extract CGPoint from AXValue
+        var windowOrigin = CGPoint.zero
+        AXValueGetValue(positionAXValue as! AXValue, .cgPoint, &windowOrigin)
+
+        // Extract CGSize from AXValue
+        var windowSize = CGSize.zero
+        AXValueGetValue(sizeAXValue as! AXValue, .cgSize, &windowSize)
+
+        // Calculate click point in the center of the title bar
+        // Title bar is typically ~22-28 points tall, click in the middle horizontally
+        let titleBarHeight: CGFloat = 25
+        let clickPoint = CGPoint(
+            x: windowOrigin.x + windowSize.width / 2,
+            y: windowOrigin.y + titleBarHeight / 2
+        )
+
+        print("WindowSwitcherController: Posting synthetic click at (\(clickPoint.x), \(clickPoint.y))")
+
+        // Create and post mouse down event
+        if let mouseDown = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseDown,
+            mouseCursorPosition: clickPoint,
+            mouseButton: .left
+        ) {
+            mouseDown.post(tap: .cghidEventTap)
+        }
+
+        // Small delay between down and up
+        usleep(10000) // 10ms
+
+        // Create and post mouse up event
+        if let mouseUp = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseUp,
+            mouseCursorPosition: clickPoint,
+            mouseButton: .left
+        ) {
+            mouseUp.post(tap: .cghidEventTap)
         }
     }
 
