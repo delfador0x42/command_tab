@@ -1,6 +1,28 @@
 import AppKit
 import SwiftUI
 
+// MARK: - SkyLight Private API
+
+private struct PSN {
+    var high: UInt32 = 0
+    var low: UInt32 = 0
+}
+
+private enum SL {
+    private static let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)!
+    private static let rt = dlopen(nil, RTLD_LAZY)!
+
+    private static func sym<T>(_ h: UnsafeMutableRawPointer, _ name: String) -> T {
+        guard let p = dlsym(h, name) else { fatalError("Missing symbol: \(name)") }
+        return unsafeBitCast(p, to: T.self)
+    }
+
+    static let mainConnectionID: @convention(c) () -> Int32 = sym(sky, "SLSMainConnectionID")
+    static let orderWindow: @convention(c) (Int32, UInt32, Int32, UInt32) -> Int32 = sym(sky, "SLSOrderWindow")
+    static let setFrontProcess: @convention(c) (UnsafeMutableRawPointer, UInt32, UInt32) -> Int32 = sym(sky, "_SLPSSetFrontProcessWithOptions")
+    static let getProcessForPID: @convention(c) (pid_t, UnsafeMutableRawPointer) -> Int32 = sym(rt, "GetProcessForPID")
+}
+
 // MARK: - Window Item
 
 struct SwitcherWindowItem: Identifiable {
@@ -9,6 +31,7 @@ struct SwitcherWindowItem: Identifiable {
     let windowTitle: String
     let icon: NSImage?
     let pid: pid_t
+    let windowID: CGWindowID
 }
 
 // MARK: - Window Enumerator
@@ -28,7 +51,8 @@ final class WindowEnumerator {
 
         for info in windowInfoList {
 		print(info)
-            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+            guard let windowNumber = info[kCGWindowNumber as String] as? Int,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t,
                   let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
                   let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
                   let w = bounds["Width"], let h = bounds["Height"],
@@ -59,7 +83,8 @@ final class WindowEnumerator {
                         appName: app.localizedName ?? "Unknown",
                         windowTitle: title,
                         icon: app.icon,
-                        pid: pid
+                        pid: pid,
+                        windowID: CGWindowID(windowNumber)
                     ))
                     break
                 }
@@ -139,7 +164,7 @@ final class KeyboardEventTapHandler {
     /// - Parameter controller: The controller that will handle switcher actions
     init(controller: WindowSwitcherController) {
         self.windowSwitcherController = controller
-        setupKeyboardEventTap()
+        setupEventTap()
     }
 
     private func setupEventTap() {
@@ -153,7 +178,7 @@ final class KeyboardEventTapHandler {
             eventsOfInterest: CGEventMask(mask),
             callback: { _, type, event, refcon in
                 guard let refcon = refcon else { return Unmanaged.passRetained(event) }
-                let handler = Unmanaged<EventTapHandler>.fromOpaque(refcon).takeUnretainedValue()
+                let handler = Unmanaged<KeyboardEventTapHandler>.fromOpaque(refcon).takeUnretainedValue()
                 return handler.handleEvent(type: type, event: event)
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
@@ -174,6 +199,11 @@ final class KeyboardEventTapHandler {
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
+    private func reenableEventTapIfNeeded() {
+        guard let tap = eventTap else { return }
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
     private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             reenableEventTapIfNeeded()
@@ -185,12 +215,12 @@ final class KeyboardEventTapHandler {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
 
         // Cmd+Tab - window switcher
-        if type == .keyDown && keyCode == 48 && flags.contains(.maskCommand) {
+        if type == .keyDown && keyCode == 48 && modifierFlags.contains(CGEventFlags.maskCommand) {
             DispatchQueue.main.async { [weak self] in
-                guard let c = self?.controller else { return }
+                guard let c = self?.windowSwitcherController else { return }
                 Task { @MainActor in
                     if c.isVisible {
-                        flags.contains(.maskShift) ? c.selectPrevious() : c.selectNext()
+                        modifierFlags.contains(CGEventFlags.maskShift) ? c.selectPrevious() : c.selectNext()
                     } else {
                         c.show()
                     }
@@ -200,9 +230,9 @@ final class KeyboardEventTapHandler {
         }
 
         // Cmd+Ctrl+U - randomize window z-order
-        if type == .keyDown && keyCode == 32 && flags.contains(.maskCommand) && flags.contains(.maskControl) {
+        if type == .keyDown && keyCode == 32 && modifierFlags.contains(CGEventFlags.maskCommand) && modifierFlags.contains(CGEventFlags.maskControl) {
             DispatchQueue.main.async { [weak self] in
-                guard let c = self?.controller else { return }
+                guard let c = self?.windowSwitcherController else { return }
                 Task { @MainActor in
                     c.randomizeWindowOrder()
                 }
@@ -210,9 +240,9 @@ final class KeyboardEventTapHandler {
             return nil
         }
 
-        if type == .flagsChanged && !flags.contains(.maskCommand) {
+        if type == .flagsChanged && !modifierFlags.contains(CGEventFlags.maskCommand) {
             DispatchQueue.main.async { [weak self] in
-                guard let c = self?.controller else { return }
+                guard let c = self?.windowSwitcherController else { return }
                 Task { @MainActor in
                     if c.isVisible { c.hideAndFocus() }
                 }
@@ -278,46 +308,54 @@ final class WindowSwitcherController {
     }
 
     func show() {
-        windows = WindowEnumerator.shared.getAllWindows()
-        guard !windows.isEmpty else { return }
+        availableWindows = WindowEnumerator.shared.getAllWindows()
+        guard !availableWindows.isEmpty else { return }
 
-        selectedIndex = min(1, windows.count - 1)
+        selectedWindowIndex = min(1, availableWindows.count - 1)
         isVisible = true
 
-        if panel == nil { panel = WindowSwitcherPanel() }
-        panel?.contentView = NSHostingView(rootView: WindowSwitcherView())
+        if switcherPanel == nil { switcherPanel = WindowSwitcherPanel() }
+        switcherPanel?.contentView = NSHostingView(rootView: WindowSwitcherView())
 
         let width: CGFloat = 420
-        let height = min(CGFloat(windows.count) * 36 + 32, 500)
+        let height = min(CGFloat(availableWindows.count) * 36 + 32, 500)
 
         if let screen = NSScreen.main {
             let f = screen.frame
-            panel?.setFrame(NSRect(x: f.midX - width/2, y: f.midY - height/2, width: width, height: height), display: true)
+            switcherPanel?.setFrame(NSRect(x: f.midX - width/2, y: f.midY - height/2, width: width, height: height), display: true)
         }
 
         NSApp.activate()
-        panel?.makeKeyAndOrderFront(nil)
+        switcherPanel?.makeKeyAndOrderFront(nil)
     }
 
     func hide() {
         isVisible = false
-        panel?.orderOut(nil)
+        switcherPanel?.orderOut(nil)
     }
 
     func hideAndFocus() {
-        guard selectedIndex < windows.count else { hide(); return }
-        let selected = windows[selectedIndex]
-        hide()
-        windows = []
+        guard selectedWindowIndex < availableWindows.count else { hide(); return }
+        let selected = availableWindows[selectedWindowIndex]
+        // Focus target BEFORE hiding panel — otherwise macOS reactivates
+        // the previously active app when our panel is ordered out.
         focusWindow(selected)
+        isVisible = false
+        switcherPanel?.orderOut(nil)
+        availableWindows = []
     }
 
     private func focusWindow(_ item: SwitcherWindowItem) {
-        guard let targetApp = NSRunningApplication(processIdentifier: item.pid) else { return }
+        // SkyLight: force-focus via window server
+        var psn = PSN()
+        withUnsafeMutablePointer(to: &psn) { ptr in
+            let raw = UnsafeMutableRawPointer(ptr)
+            _ = SL.getProcessForPID(item.pid, raw)
+            _ = SL.setFrontProcess(raw, item.windowID, 0)
+        }
+        _ = SL.orderWindow(SL.mainConnectionID(), item.windowID, 1, 0) // 1 = above, 0 = topmost
 
-        NSApp.yieldActivation(to: targetApp)
-        targetApp.activate()
-
+        // AX raise as belt-and-suspenders
         let axApp = AXUIElementCreateApplication(item.pid)
         var ref: AnyObject?
         guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
@@ -328,21 +366,19 @@ final class WindowSwitcherController {
             if AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &titleRef) == .success,
                let title = titleRef as? String, title == item.windowTitle {
                 AXUIElementPerformAction(w, kAXRaiseAction as CFString)
-                AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
-                AXUIElementSetAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, w)
                 break
             }
         }
     }
 
     func selectNext() {
-        guard !windows.isEmpty else { return }
-        selectedIndex = (selectedIndex + 1) % windows.count
+        guard !availableWindows.isEmpty else { return }
+        selectedWindowIndex = (selectedWindowIndex + 1) % availableWindows.count
     }
 
     func selectPrevious() {
-        guard !windows.isEmpty else { return }
-        selectedIndex = (selectedIndex - 1 + windows.count) % windows.count
+        guard !availableWindows.isEmpty else { return }
+        selectedWindowIndex = (selectedWindowIndex - 1 + availableWindows.count) % availableWindows.count
     }
 
     func randomizeWindowOrder() {
@@ -478,7 +514,7 @@ struct WindowItemRow: View {
     /// The application icon image
     @ViewBuilder
     private var applicationIconView: some View {
-        if let icon = windowItem.applicationIcon {
+        if let icon = windowItem.icon {
             Image(nsImage: icon)
                 .resizable()
                 .frame(width: iconSize, height: iconSize)
@@ -499,7 +535,7 @@ struct WindowItemRow: View {
 
     /// The application name label
     private var applicationNameText: some View {
-        Text(windowItem.applicationName)
+        Text(windowItem.appName)
             .font(.system(size: applicationNameFontSize, weight: .medium))
     }
 
