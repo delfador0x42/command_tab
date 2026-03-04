@@ -9,6 +9,7 @@ import SwiftUI
 ///   - psn: ProcessSerialNumber of the target app
 ///   - wid: Window ID (0 to just activate the app)
 ///   - mode: Activation mode (0x1 = kCPSUserGenerated to simulate user click)
+@discardableResult
 @_silgen_name("_SLPSSetFrontProcessWithOptions")
 func SLPSSetFrontProcessWithOptions(_ psn: inout ProcessSerialNumber, _ wid: UInt32, _ mode: UInt32) -> CGError
 
@@ -22,26 +23,6 @@ func GetProcessForPID(_ pid: pid_t, _ psn: inout ProcessSerialNumber) -> OSStatu
 @_silgen_name("_AXUIElementGetWindow")
 func AXUIElementGetWindow(_ element: AXUIElement, _ windowID: inout CGWindowID) -> AXError
 
-/// Carbon API for setting front process with options (used by Contexts.app)
-/// This is more reliable than NSRunningApplication.activate() on modern macOS
-/// Options: kSetFrontProcessFrontWindowOnly = 1, kSetFrontProcessCausedByUser = 2 (what we want)
-@_silgen_name("SetFrontProcessWithOptions")
-func SetFrontProcessWithOptions(_ psn: inout ProcessSerialNumber, _ options: UInt32) -> OSStatus
-
-/// CGS private API to get the main connection ID to the window server
-/// Used by Contexts.app for direct window server communication
-@_silgen_name("CGSMainConnectionID")
-func CGSMainConnectionID() -> UInt32
-
-/// CGS private API to get the current active space ID
-@_silgen_name("CGSGetActiveSpace")
-func CGSGetActiveSpace(_ cid: UInt32) -> UInt64
-
-/// CGS private API to set the front process for a specific space
-/// This is the key API Contexts.app uses to bring windows to front
-@_silgen_name("CGSSpaceSetFrontPSN")
-func CGSSpaceSetFrontPSN(_ cid: UInt32, _ spaceID: UInt64, _ psn: inout ProcessSerialNumber) -> CGError
-
 /// Private SkyLight API to post raw event records to the WindowServer
 /// This is how AltTab makes a specific window the "key" window
 /// Parameters:
@@ -52,10 +33,6 @@ func SLPSPostEventRecordTo(_ psn: inout ProcessSerialNumber, _ bytes: UnsafeMuta
 
 /// Flag that indicates the activation was user-generated (simulates user click)
 private let kCPSUserGenerated: UInt32 = 0x1
-
-/// Carbon SetFrontProcessWithOptions flags
-private let kSetFrontProcessFrontWindowOnly: UInt32 = 1 << 0
-private let kSetFrontProcessCausedByUser: UInt32 = 1 << 1
 
 // MARK: - Data Models
 
@@ -781,18 +758,28 @@ final class WindowSwitcherController {
         // Calculate and set the panel's frame
         configurePanelFrame()
 
-        // Show the panel WITHOUT activating our app
-        // The panel is a floating panel at screenSaver level, so it appears above everything
-        // By not activating our app, we avoid disrupting the window ordering of other apps
+        // Activate our app so we become the macOS "active" app.
+        // This properly deactivates the previously focused app, which is required for
+        // cooperative activation: only the active app's yieldActivation() has effect.
+        // The panel is at screenSaver level so z-order of other windows isn't disrupted.
+        NSApp.activate()
         switcherPanel?.orderFrontRegardless()
 
         print("WindowSwitcherController: Showing window switcher with \(availableWindows.count) windows")
     }
 
     /// Hides the window switcher panel without focusing any window.
+    /// Yields activation back to whichever app was active before the switcher appeared.
     func hideWindowSwitcher() {
         isVisible = false
         switcherPanel?.orderOut(nil)
+
+        // Yield back to the previously active app so it regains focus
+        if let previousApp = previouslyActiveApplication {
+            NSApp.yieldActivation(to: previousApp)
+            previousApp.activate()
+            previouslyActiveApplication = nil
+        }
 
         print("WindowSwitcherController: Hiding window switcher")
     }
@@ -808,14 +795,14 @@ final class WindowSwitcherController {
         // Get the selected window
         let selectedWindow = availableWindows[selectedWindowIndex]
 
-        // Hide the switcher
-        hideWindowSwitcher()
-
-        // Clear the window list
-        availableWindows = []
-
-        // Focus the selected window
+        // Focus BEFORE hiding — when the panel orders out, macOS reactivates
+        // the previously active app. We must activate the target first.
         focusWindow(selectedWindow)
+
+        // Now hide the switcher and clear state
+        isVisible = false
+        switcherPanel?.orderOut(nil)
+        availableWindows = []
     }
 
     // MARK: Public Methods - Navigation
@@ -900,223 +887,67 @@ final class WindowSwitcherController {
 
     /// Focuses a specific window, bringing it to the front and activating its application.
     ///
-    /// Uses a combination of private and public APIs for maximum reliability (same approach as Contexts.app):
-    /// 1. Carbon SetFrontProcessWithOptions - the API Contexts.app uses
-    /// 2. Private _SLPSSetFrontProcessWithOptions - SkyLight API
-    /// 3. Public NSRunningApplication.activate() - backup
-    /// 4. Accessibility API - raises specific window within the app
-    ///
-    /// - Parameter windowItem: The window to focus
+    /// Uses AltTab's proven technique: SkyLight activation with specific windowID,
+    /// raw WindowServer events to make it key, then AX raise. Three steps, no conflicts.
     private func focusWindow(_ windowItem: SwitcherWindowItem) {
-        // Get the running application
-        guard let targetApplication = NSRunningApplication(processIdentifier: windowItem.processIdentifier) else {
-            print("WindowSwitcherController: Could not find application for PID \(windowItem.processIdentifier)")
-            return
-        }
-
         var psn = ProcessSerialNumber()
-        let psnResult = GetProcessForPID(windowItem.processIdentifier, &psn)
-        if psnResult == noErr {
-            // Step 1: Use CGS private API to set front process for the current space
-            // This is what Contexts.app uses - it directly tells the window server
-            let cid = CGSMainConnectionID()
-            let currentSpace = CGSGetActiveSpace(cid)
-            let cgsResult = CGSSpaceSetFrontPSN(cid, currentSpace, &psn)
-            print("WindowSwitcherController: CGSSpaceSetFrontPSN returned \(cgsResult) (space: \(currentSpace))")
-
-            // Step 2: Use Carbon SetFrontProcessWithOptions (also used by Contexts.app)
-            // kSetFrontProcessCausedByUser tells the system this was user-initiated
-            let carbonResult = SetFrontProcessWithOptions(&psn, kSetFrontProcessCausedByUser)
-            print("WindowSwitcherController: SetFrontProcessWithOptions returned \(carbonResult)")
-
-            // Step 3: Also use SkyLight API for forceful activation
-            // wid=0 means just activate the app, mode=kCPSUserGenerated simulates user click
-            let slpsResult = SLPSSetFrontProcessWithOptions(&psn, 0, kCPSUserGenerated)
-            print("WindowSwitcherController: SLPSSetFrontProcessWithOptions returned \(slpsResult)")
-        } else {
-            print("WindowSwitcherController: GetProcessForPID failed with \(psnResult)")
-        }
-
-        // Step 4: Also call public API as backup
-        targetApplication.activate()
-
-        // Step 5: Small delay for WindowServer to process the activation
-        // This gives the window server time to reorder windows before we try to raise ours
-        usleep(50000) // 50ms
-
-        // Step 6: Raise the specific window via Accessibility API
-        raiseSpecificWindow(windowItem)
-
-        // Clear the stored previous app reference
-        previouslyActiveApplication = nil
-
-        print("WindowSwitcherController: Focused window '\(windowItem.windowTitle)' in '\(windowItem.applicationName)'")
-    }
-
-    /// Raises a specific window to the front using Accessibility APIs.
-    ///
-    /// - Parameter windowItem: The window to raise
-    private func raiseSpecificWindow(_ windowItem: SwitcherWindowItem) {
-        // Create an Accessibility application element
-        let accessibilityApplication = AXUIElementCreateApplication(windowItem.processIdentifier)
-
-        // Get the list of windows
-        var windowsAttributeValue: AnyObject?
-        let result = AXUIElementCopyAttributeValue(
-            accessibilityApplication,
-            kAXWindowsAttribute as CFString,
-            &windowsAttributeValue
-        )
-
-        guard result == .success,
-              let accessibilityWindows = windowsAttributeValue as? [AXUIElement] else {
+        guard GetProcessForPID(windowItem.processIdentifier, &psn) == noErr else {
+            print("WindowSwitcherController: GetProcessForPID failed for PID \(windowItem.processIdentifier)")
             return
         }
 
-        // Find the window with the matching title
-        for accessibilityWindow in accessibilityWindows {
-            var titleAttributeValue: AnyObject?
-            let titleResult = AXUIElementCopyAttributeValue(
-                accessibilityWindow,
-                kAXTitleAttribute as CFString,
-                &titleAttributeValue
-            )
+        // Find the AX window and get its CGWindowID
+        let axApp = AXUIElementCreateApplication(windowItem.processIdentifier)
+        var windowsRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement] else {
+            print("WindowSwitcherController: Could not get windows for PID \(windowItem.processIdentifier)")
+            return
+        }
 
-            if titleResult == .success,
-               let windowTitle = titleAttributeValue as? String,
-               windowTitle == windowItem.windowTitle {
+        for axWindow in axWindows {
+            var titleRef: AnyObject?
+            guard AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef) == .success,
+                  let title = titleRef as? String,
+                  title == windowItem.windowTitle else { continue }
 
-                // Get the CGWindowID from the AXUIElement using private API
-                // This bridges Accessibility to Core Graphics for more direct window control
-                var cgWindowID: CGWindowID = 0
-                let windowIDResult = AXUIElementGetWindow(accessibilityWindow, &cgWindowID)
-                if windowIDResult == .success && cgWindowID != 0 {
-                    print("WindowSwitcherController: Got CGWindowID \(cgWindowID) for window '\(windowTitle)'")
+            // Get CGWindowID from AX element
+            var cgWindowID: CGWindowID = 0
+            let gotWindowID = AXUIElementGetWindow(axWindow, &cgWindowID) == .success && cgWindowID != 0
 
-                    // Try using the window ID with SLPSSetFrontProcessWithOptions
-                    // This tells the window server to focus this specific window
-                    var psn = ProcessSerialNumber()
-                    if GetProcessForPID(windowItem.processIdentifier, &psn) == noErr {
-                        let result = SLPSSetFrontProcessWithOptions(&psn, cgWindowID, kCPSUserGenerated)
-                        print("WindowSwitcherController: SLPSSetFrontProcessWithOptions with windowID returned \(result)")
-
-                        // Use AltTab's technique: send raw event bytes to WindowServer to make window key
-                        // This sends the magic bytes that tell WindowServer to make this specific window the key window
-                        makeKeyWindow(&psn, windowID: cgWindowID)
-                    }
-                }
-
-                // Set the application as frontmost via Accessibility API
-                AXUIElementSetAttributeValue(
-                    accessibilityApplication,
-                    kAXFrontmostAttribute as CFString,
-                    kCFBooleanTrue
-                )
-
-                // Raise the window to bring it to front within the app
-                AXUIElementPerformAction(accessibilityWindow, kAXRaiseAction as CFString)
-
-                // Set as main window
-                AXUIElementSetAttributeValue(
-                    accessibilityWindow,
-                    kAXMainAttribute as CFString,
-                    kCFBooleanTrue
-                )
-
-                // Set focused attribute directly on the window (per SwitchR approach)
-                AXUIElementSetAttributeValue(
-                    accessibilityWindow,
-                    kAXFocusedAttribute as CFString,
-                    kCFBooleanTrue
-                )
-
-                // Also set as focused window on the app
-                AXUIElementSetAttributeValue(
-                    accessibilityApplication,
-                    kAXFocusedWindowAttribute as CFString,
-                    accessibilityWindow
-                )
-
-                // Post a synthetic mouse click on the window's title bar
-                // This is the most "user-like" action and forces the window server to respect it
-                postSyntheticClickOnWindow(accessibilityWindow)
-
-                break
+            // Step 0: Cooperative activation — yield from our app to the target
+            // so macOS grants activation willingly instead of us forcing it.
+            if let targetApp = NSRunningApplication(processIdentifier: windowItem.processIdentifier) {
+                NSApp.yieldActivation(to: targetApp)
             }
-        }
-    }
 
-    /// Posts a synthetic mouse click on a window's title bar to force it to the front.
-    ///
-    /// This simulates what happens when a user physically clicks on a window - the window
-    /// server treats synthetic CGEvents as real user input and will bring the window forward.
-    ///
-    /// - Parameter windowElement: The AXUIElement representing the window
-    private func postSyntheticClickOnWindow(_ windowElement: AXUIElement) {
-        // Get the window's position
-        var positionValue: AnyObject?
-        let positionResult = AXUIElementCopyAttributeValue(
-            windowElement,
-            kAXPositionAttribute as CFString,
-            &positionValue
-        )
+            if gotWindowID {
+                // Step 1: Activate process with specific window via SkyLight
+                // Using the actual windowID (not 0) tells WindowServer exactly which window to activate
+                SLPSSetFrontProcessWithOptions(&psn, cgWindowID, kCPSUserGenerated)
 
-        // Get the window's size
-        var sizeValue: AnyObject?
-        let sizeResult = AXUIElementCopyAttributeValue(
-            windowElement,
-            kAXSizeAttribute as CFString,
-            &sizeValue
-        )
+                // Step 2: Send raw event bytes to make this window key (AltTab technique)
+                makeKeyWindow(&psn, windowID: cgWindowID)
+            } else {
+                // Fallback: activate process without specific window
+                SLPSSetFrontProcessWithOptions(&psn, 0, kCPSUserGenerated)
+            }
 
-        guard positionResult == .success,
-              sizeResult == .success,
-              let positionAXValue = positionValue,
-              let sizeAXValue = sizeValue else {
-            print("WindowSwitcherController: Could not get window position/size for synthetic click")
-            return
+            // Step 3: Raise the window via Accessibility
+            AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+
+            // Step 4: Public API activation as belt-and-suspenders.
+            // SkyLight handles the window server, but NSRunningApplication.activate()
+            // ensures macOS marks the app as frontmost (active traffic lights, menu bar).
+            if let targetApp = NSRunningApplication(processIdentifier: windowItem.processIdentifier) {
+                targetApp.activate()
+            }
+
+            print("WindowSwitcherController: Focused '\(windowItem.windowTitle)' in '\(windowItem.applicationName)' (wid: \(cgWindowID))")
+            break
         }
 
-        // Extract CGPoint from AXValue
-        var windowOrigin = CGPoint.zero
-        AXValueGetValue(positionAXValue as! AXValue, .cgPoint, &windowOrigin)
-
-        // Extract CGSize from AXValue
-        var windowSize = CGSize.zero
-        AXValueGetValue(sizeAXValue as! AXValue, .cgSize, &windowSize)
-
-        // Calculate click point in the center of the title bar
-        // Title bar is typically ~22-28 points tall, click in the middle horizontally
-        let titleBarHeight: CGFloat = 25
-        let clickPoint = CGPoint(
-            x: windowOrigin.x + windowSize.width / 2,
-            y: windowOrigin.y + titleBarHeight / 2
-        )
-
-        print("WindowSwitcherController: Posting synthetic click at (\(clickPoint.x), \(clickPoint.y))")
-
-        // Create and post mouse down event
-        if let mouseDown = CGEvent(
-            mouseEventSource: nil,
-            mouseType: .leftMouseDown,
-            mouseCursorPosition: clickPoint,
-            mouseButton: .left
-        ) {
-            mouseDown.post(tap: .cghidEventTap)
-        }
-
-        // Small delay between down and up
-        usleep(10000) // 10ms
-
-        // Create and post mouse up event
-        if let mouseUp = CGEvent(
-            mouseEventSource: nil,
-            mouseType: .leftMouseUp,
-            mouseCursorPosition: clickPoint,
-            mouseButton: .left
-        ) {
-            mouseUp.post(tap: .cghidEventTap)
-        }
+        previouslyActiveApplication = nil
     }
 
     /// Makes a specific window the "key" window using raw WindowServer events.

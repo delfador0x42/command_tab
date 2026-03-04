@@ -8,6 +8,10 @@ private struct PSN {
     var low: UInt32 = 0
 }
 
+
+
+
+
 private enum SL {
     private static let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)!
     private static let rt = dlopen(nil, RTLD_LAZY)!
@@ -23,8 +27,13 @@ private enum SL {
     static let getProcessForPID: @convention(c) (pid_t, UnsafeMutableRawPointer) -> Int32 = sym(rt, "GetProcessForPID")
 }
 
-// MARK: - Window Item
 
+
+
+
+
+
+// MARK: - Window Item
 struct SwitcherWindowItem: Identifiable {
     let id = UUID()
     let appName: String
@@ -33,6 +42,9 @@ struct SwitcherWindowItem: Identifiable {
     let pid: pid_t
     let windowID: CGWindowID
 }
+
+
+
 
 // MARK: - Window Enumerator
 
